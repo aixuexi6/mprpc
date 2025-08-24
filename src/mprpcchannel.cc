@@ -55,7 +55,9 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
 
     //组织待发送的rpc请求字符串
     std::string send_rpc_str;
-    send_rpc_str.insert(0,std::string((char*)&header_size,4));//header_size
+    uint32_t net_header_size = htonl(header_size);  // 主机序转网络序
+    send_rpc_str.insert(0, std::string(reinterpret_cast<const char*>(&net_header_size), 4));
+    // send_rpc_str.insert(0,std::string((char*)&header_size,4));//header_size
     send_rpc_str+=rpc_header_str;//rpcheader
     send_rpc_str+=args_str;//args
 
@@ -84,29 +86,33 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
     //std::string ip=MprpcApplication::GetInstance().GetConfig().Load("rpcserverip");
     //uint16_t port=atoi(MprpcApplication::GetInstance().GetConfig().Load("rpcserverport").c_str());
 
-    ZkClient zkCli;
-    zkCli.Start();
-    std::string method_path="/"+service_name+"/"+method_name;
-    std::string host_data=zkCli.GetData(method_path.c_str());
-    if(host_data=="")
-    {
-        controller->SetFailed(method_path+"is not exist!");
-        return;
-    }
-    int idx=host_data.find(":");
-    if(idx==-1)
-    {
-        controller->SetFailed(method_path+"address is invaild!");
-        return;
-    }
+    //配置nginx
+    std::string nginx_ip = MprpcApplication::GetInstance().GetConfig().Load("nginxip");
+    uint16_t nginx_port = atoi(MprpcApplication::GetInstance().GetConfig().Load("nginxport").c_str());
 
-    std::string ip=host_data.substr(0,idx);
-    uint16_t port=atoi(host_data.substr(idx+1,host_data.size()-idx).c_str());
+    // ZkClient zkCli;
+    // zkCli.Start();
+    // std::string method_path="/"+service_name+"/"+method_name;
+    // std::string host_data=zkCli.GetData(method_path.c_str());
+    // if(host_data=="")
+    // {
+    //     controller->SetFailed(method_path+"is not exist!");
+    //     return;
+    // }
+    // int idx=host_data.find(":");
+    // if(idx==-1)
+    // {
+    //     controller->SetFailed(method_path+"address is invaild!");
+    //     return;
+    // }
+
+    // std::string ip=host_data.substr(0,idx);
+    // uint16_t port=atoi(host_data.substr(idx+1,host_data.size()-idx).c_str());
 
     struct sockaddr_in server_addr;
     server_addr.sin_family=AF_INET;
-    server_addr.sin_port=htons(port);
-    server_addr.sin_addr.s_addr=inet_addr(ip.c_str());
+    server_addr.sin_port=htons(nginx_port);
+    server_addr.sin_addr.s_addr=inet_addr(nginx_ip.c_str());
 
     //连接rpc服务节点
     if(-1==connect(clientfd,(sockaddr *)&server_addr,sizeof(server_addr)))
@@ -147,7 +153,8 @@ void MprpcChannel::CallMethod(const google::protobuf::MethodDescriptor* method,
     {
         close(clientfd);
         char errText[512]={0};
-        sprintf(errText,"response parse error,response_str:%s",recv_buf);
+        snprintf(errText, sizeof(errText), 
+         "response parse error,response_str:%s", recv_buf);
         controller->SetFailed(errText);
         return;
     }

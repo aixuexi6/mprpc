@@ -28,42 +28,72 @@ void RpcProvider::NotifyService(google::protobuf::Service *service)
     m_serviceMap.insert({service_name,service_info});
 }
 
-void RpcProvider::Run() 
-{
-    std::string ip=MprpcApplication::GetInstance().GetConfig().Load("rpcserverip");
-    uint16_t port=atoi(MprpcApplication::GetInstance().GetConfig().Load("rpcserverport").c_str());
-    muduo::net::InetAddress address(ip,port);
+void RpcProvider::Run() {
+    std::string ip = MprpcApplication::GetInstance().GetConfig().Load("rpcserverip");
+    uint16_t port = atoi(MprpcApplication::GetInstance().GetConfig().Load("rpcserverport").c_str());
+    muduo::net::InetAddress address(ip, port);
 
-    //创建TcpServer对象
-    muduo::net::TcpServer server(&m_eventLoop,address,"RpcProvider");
-    //绑定连接回调和消息读写回调 分离了网络代码和业务代码
-    server.setConnectionCallback(std::bind(&RpcProvider::OnConnection,this,std::placeholders::_1));
-    server.setMessageCallback(std::bind(&RpcProvider::OnMessage,this,std::placeholders::_1,
-                        std::placeholders::_2,std::placeholders::_3));
-    //设置muduo库线程数量
+    // 创建TcpServer对象
+    muduo::net::TcpServer server(&m_eventLoop, address, "RpcProvider");
+    server.setConnectionCallback(std::bind(&RpcProvider::OnConnection, this, std::placeholders::_1));
+    server.setMessageCallback(std::bind(&RpcProvider::OnMessage, this, std::placeholders::_1,
+                        std::placeholders::_2, std::placeholders::_3));
     server.setThreadNum(4);
 
-    //把当前rpc节点要发布的服务全部注册到zk上面，使得rpc client可以从zk上发现服务
-    ZkClient zkCli;
+    // 获取ZooKeeper配置
+    std::string zk_ip = MprpcApplication::GetInstance().GetConfig().Load("zookeeperip");
+    std::string zk_port = MprpcApplication::GetInstance().GetConfig().Load("zookeeperport");
+    
+    if (zk_ip.empty() || zk_port.empty()) {
+        LOG_ERR("ZooKeeper configuration missing!");
+        return;
+    }
+    std::string zk_host = zk_ip + ":" + zk_port;
+
+    // 使用正确的ZooKeeper地址
+    ZkClient zkCli(zk_host);
     zkCli.Start();
 
-    for(auto &sp:m_serviceMap)
-    {
-        std::string service_path="/"+sp.first;
-        zkCli.Create(service_path.c_str(),nullptr,0);
-        for(auto &mp:sp.second.m_methodMap)
-        {
-            std::string method_path=service_path+"/"+mp.first;
-            char method_path_data[128]={0};
-            sprintf(method_path_data,"%s:%d",ip.c_str(),port);
-            //ZOO_EPHEMERAL表示znode是临时性节点
-            zkCli.Create(method_path.c_str(),method_path_data,strlen(method_path_data),ZOO_EPHEMERAL);
+    // 等待连接建立
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (!zkCli.IsConnected()) {
+        LOG_ERR("Failed to connect to ZooKeeper at %s", zk_host.c_str());
+        return;
+    }
+
+    // 集群模式注册服务
+    for (auto &sp : m_serviceMap) {
+        // 1. 创建服务根节点（持久节点）
+        std::string service_root = "/" + sp.first;
+        if (!zkCli.Exists(service_root.c_str())) {
+            zkCli.Create(service_root.c_str(), nullptr, 0, 0); // 0表示持久节点
+            LOG_INFO("Created service root: %s", service_root.c_str());
+        }
+        
+        // 2. 为每个方法创建实例节点
+        for (auto &mp : sp.second.m_methodMap) {
+            // 方法节点路径
+            std::string method_path = service_root + "/" + mp.first;
+            
+            // 如果方法节点不存在，则创建
+            if (!zkCli.Exists(method_path.c_str())) {
+                zkCli.Create(method_path.c_str(), nullptr, 0, 0); // 持久节点
+                LOG_INFO("Created method node: %s", method_path.c_str());
+            }
+            
+            // 3. 在方法节点下创建服务实例节点（临时顺序节点）
+            std::string instance_path = method_path + "/instance-";
+            char instance_data[128];
+            snprintf(instance_data, sizeof(instance_data), "%s:%d", ip.c_str(), port);
+            
+            // 创建临时顺序节点
+            zkCli.Create(instance_path.c_str(), instance_data, strlen(instance_data), ZOO_EPHEMERAL | ZOO_SEQUENCE);
+            LOG_INFO("Registered service instance: %s at %s", instance_path.c_str(), instance_data);
         }
     }
 
-    std::cout<<"rpcprovider start service at ip:"<<ip<<" port:"<<port<<std::endl;
-
-    //启动网络服务
+    // 启动服务
+    LOG_INFO("RPC Provider starting at %s:%d", ip.c_str(), port);
     server.start();
     m_eventLoop.loop();
 }
@@ -77,30 +107,23 @@ void RpcProvider::OnConnection(const muduo::net::TcpConnectionPtr &conn)
     }
 }
 
-/*
-在框架内部，RpcProvider和RpcConsumer协商好通信用的protobuf数据类型
-service_name method_name args           定义proto的message类型，进行数据头的序列化和反序列化
-16UserServiceLogin zhangsan123456       service_name method_name args_size
-header_size(4字节) + header_str + args_str
-*/
 void RpcProvider::OnMessage(const muduo::net::TcpConnectionPtr &conn, 
                             muduo::net::Buffer *buffer, 
                             muduo::Timestamp)
 {
     //网络上接受的远程rpc请求的字符流 Login args
     std::string recv_buf=buffer->retrieveAllAsString();
-    //std::cout << "recv_buf: " << recv_buf << std::endl;
 
     //从字符流读取前4个字节的内容
     uint32_t header_size=0;
-    recv_buf.copy((char*)&header_size,4,0);
+    uint32_t net_header_size = 0;
+    recv_buf.copy(reinterpret_cast<char*>(&net_header_size), 4, 0);
 
-    //std::cout << "Header size: " << header_size << std::endl;
+    // 将网络字节序转换为主机字节序
+    header_size = ntohl(net_header_size);
     
     //根据header_size读取数据头的原始字符流，反序列化数据，得到rpc请求的详细信息
     std::string rpc_header_str=recv_buf.substr(4,header_size);
-
-    //std::cout << "Rpc header string: " << rpc_header_str << std::endl;
 
     mprpc::RpcHeader rpcHeader;
     std::string service_name;

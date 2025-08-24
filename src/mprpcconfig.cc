@@ -73,3 +73,7 @@ void MprpcConfig::Trim(std::string &src_buf)
         src_buf = src_buf.substr(0, idx + 1);
     }
 }
+
+void MprpcConfig::SetConfig(const std::string& key, const std::string& value) {
+    m_configMap[key] = value;
+}
